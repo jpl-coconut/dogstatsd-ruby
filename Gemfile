@@ -3,6 +3,7 @@ source 'https://rubygems.org'
 gemspec
 
 gem 'rake', '>= 12.3.3'
+gem 'concurrent-ruby'
 gem 'minitest'
 gem 'parallel'
 gem 'single_cov'

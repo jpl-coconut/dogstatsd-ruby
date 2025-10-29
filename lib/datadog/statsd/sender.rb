@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'concurrent'
+
 module Datadog
   class Statsd
     # Sender is using a companion thread to flush and pack messages
@@ -10,9 +12,13 @@ module Datadog
     # a dead companion thread means that a fork just happened and that we are
     # running in the child process).
     class Sender
-      CLOSEABLE_QUEUES = Queue.instance_methods.include?(:close)
-
       def initialize(message_buffer, telemetry: nil, queue_size: UDP_DEFAULT_BUFFER_SIZE, logger: nil, flush_interval: nil, queue_class: Queue, thread_class: Thread)
+        raise RuntimeError.new("Unsupported Queue Class: #{queue_class}") unless queue_class == Queue
+        raise RuntimeError.new("Unsupported Thread Class: #{thread_class}") unless thread_class == Thread
+
+        #Override
+        queue_class = Concurrent::Array
+
         @message_buffer = message_buffer
         @telemetry = telemetry
         @queue_size = queue_size
@@ -29,8 +35,9 @@ module Datadog
       end
 
       def flush(sync: false)
+        @logger.warn { "Statsd: Flushing the queue synchronously and waiting" } if (@logger && @sync)
         # keep a copy around in case another thread is calling #stop while this method is running
-        current_message_queue = message_queue
+        current_message_queue = @message_queue
 
         # don't try to flush if there is no message_queue instantiated or
         # no companion thread running
@@ -38,35 +45,36 @@ module Datadog
           @logger.debug { "Statsd: can't flush: no message queue ready" } if @logger
           return
         end
-        if !sender_thread.alive?
+        if !@sender_thread.alive?
           @logger.debug { "Statsd: can't flush: no sender_thread alive" } if @logger
           return
         end
 
-        current_message_queue.push(:flush)
+        current_message_queue.unshift(:flush)
         rendez_vous if sync
       end
 
       def rendez_vous
         # could happen if #start hasn't be called
+        message_queue = @message_queue
         return unless message_queue
 
-        # Initialize and get the thread's sync queue
-        queue = (@thread_class.current[:statsd_sync_queue] ||= @queue_class.new)
+        # We use the queue as a waitable object.
+        queue = Queue.new
         # tell sender-thread to notify us in the current
         # thread's queue
-        message_queue.push(queue)
+        message_queue.unshift(queue)
         # wait for the sender thread to send a message
         # once the flush is done
         queue.pop
       end
 
       def add(message)
-        raise ArgumentError, 'Start sender first' unless message_queue
-
+        message_queue = @message_queue
         # if the thread does not exist, we assume we are running in a forked process,
         # empty the message queue and message buffers (these messages belong to
         # the parent process) and spawn a new companion thread.
+        sender_thread = @sender_thread
         if sender_thread.nil? || !sender_thread.alive?
           @mx.synchronize {
             # an attempt was previously made to start the sender thread but failed.
@@ -74,19 +82,18 @@ module Datadog
             return if @done
             # a call from another thread has already re-created
             # the companion thread before this one acquired the lock
-            break if sender_thread.alive?
+            break if @sender_thread.alive?
             @logger.debug { "Statsd: companion thread is dead, re-creating one" } if @logger
 
-            message_queue.close if CLOSEABLE_QUEUES
-            @message_queue = nil
-            message_buffer.reset
+            @message_buffer.reset
             start
+            message_queue = @message_queue
             @flush_timer.start if @flush_timer && @flush_timer.stop?
           }
         end
 
         if message_queue.length <= @queue_size
-          message_queue << message
+          message_queue.unshift(message)
         else
           if @telemetry
             bytesize = message.respond_to?(:bytesize) ? message.bytesize : 0
@@ -96,97 +103,63 @@ module Datadog
       end
 
       def start
-        raise ArgumentError, 'Sender already started' if message_queue
-
-        # initialize a new message queue for the background thread
-        @message_queue = @queue_class.new
-        begin
-          # start background thread
-          @sender_thread = @thread_class.new(&method(:send_loop))
-          @sender_thread.name = "Statsd Sender" unless Gem::Version.new(RUBY_VERSION) < Gem::Version.new('2.3')
-        rescue ThreadError => e
-          @logger.debug { "Statsd: Failed to start sender thread: #{e.message}" } if @logger
-          @mx.synchronize { @done = true }
-        end
+        @mx.synchronize {
+          if @sender_thread.nil? || !@sender_thread.alive?
+            begin
+              # initialize a new message queue for the background thread
+              @message_queue = @queue_class.new unless @message_queue
+              # start background thread
+              @sender_thread = @thread_class.new(&method(:send_loop))
+              @sender_thread.name = "Statsd Sender" unless Gem::Version.new(RUBY_VERSION) < Gem::Version.new('2.3')
+            rescue ThreadError => e
+              @logger.debug { "Statsd: Failed to start sender thread: #{e.message}" } if @logger
+              @done = true
+            end
+          end
+        }
 
         @flush_timer.start if @flush_timer
       end
 
-      if CLOSEABLE_QUEUES
-        # when calling stop, make sure that no other threads is trying
-        # to close the sender nor trying to continue to `#add` more message
-        # into the sender.
-        def stop(join_worker: true)
+      # when calling stop, make sure that no other threads is trying
+      # to close the sender nor trying to continue to `#add` more message
+      # into the sender.
+      def stop(join_worker: true)
+        sender_thread = nil
+        @mx.synchronize {
           @flush_timer.stop if @flush_timer
 
           message_queue = @message_queue
-          message_queue.close if message_queue
+          message_queue.unshift(:close) if message_queue
 
           sender_thread = @sender_thread
-          sender_thread.join if sender_thread && join_worker
-        end
-      else
-        # when calling stop, make sure that no other threads is trying
-        # to close the sender nor trying to continue to `#add` more message
-        # into the sender.
-        def stop(join_worker: true)
-          @flush_timer.stop if @flush_timer
-
-          message_queue = @message_queue
-          message_queue << :close if message_queue
-
-          sender_thread = @sender_thread
-          sender_thread.join if sender_thread && join_worker
-        end
+          @sender_thread = nil
+        }
+        sender_thread.join if sender_thread && join_worker
       end
 
       private
 
-      attr_reader :message_buffer
-      attr_reader :message_queue
-      attr_reader :sender_thread
+      def send_loop
+        loop do
+          message = @message_queue.pop
 
-      if CLOSEABLE_QUEUES
-        def send_loop
-          until (message = message_queue.pop).nil? && message_queue.closed?
-            # skip if message is nil, e.g. when message_queue
-            # is empty and closed
-            next unless message
-
-            case message
-            when :flush
-              message_buffer.flush
-            when @queue_class
-              message.push(:go_on)
-            else
-              message_buffer.add(message)
-            end
+          unless message
+            sleep(1)
+            next
           end
 
-          @message_queue = nil
-          @sender_thread = nil
-        end
-      else
-        def send_loop
-          loop do
-            message = message_queue.pop
-
-            next unless message
-
-            case message
-            when :close
-              break
-            when :flush
-              message_buffer.flush
-            when @queue_class
-              message.push(:go_on)
-            else
-              message_buffer.add(message)
-            end
+          case message
+          when :close
+            break
+          when :flush
+            @message_buffer.flush
+          when Queue
+            # It doesn't matter what we push. This just causes rendez_vous to unblock.
+            message.push(:go_on)
+          else
+            @message_buffer.add(message)
           end
-
-          @message_queue = nil
-          @sender_thread = nil
         end
       end
     end
