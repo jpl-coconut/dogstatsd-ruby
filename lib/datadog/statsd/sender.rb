@@ -146,6 +146,7 @@ module Datadog
 
           unless message
             sleep(1)
+            break unless Thread.current == @sender_thread
             next
           end
 
