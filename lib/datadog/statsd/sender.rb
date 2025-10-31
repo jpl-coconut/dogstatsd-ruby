@@ -146,9 +146,17 @@ module Datadog
       attr_reader :message_queue
       attr_reader :sender_thread
 
+      @@statsd_sleep = ENV.fetch("DATADOG_STATSD_SLEEP", 0.25).to_f
+
       if CLOSEABLE_QUEUES
         def send_loop
-          until (message = message_queue.pop).nil? && message_queue.closed?
+          begin
+            sleep @@statsd_sleep while message_queue.empty? && !message_queue.closed?
+
+            if (message = message_queue.pop).nil? && message_queue.closed?
+              break
+            end
+
             # skip if message is nil, e.g. when message_queue
             # is empty and closed
             next unless message
@@ -161,7 +169,7 @@ module Datadog
             else
               message_buffer.add(message)
             end
-          end
+          end while true
 
           @message_queue = nil
           @sender_thread = nil
@@ -169,6 +177,7 @@ module Datadog
       else
         def send_loop
           loop do
+            sleep @@statsd_sleep while message_queue.empty?
             message = message_queue.pop
 
             next unless message
