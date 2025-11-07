@@ -146,48 +146,63 @@ module Datadog
       attr_reader :message_queue
       attr_reader :sender_thread
 
-      if CLOSEABLE_QUEUES
-        def send_loop
-          until (message = message_queue.pop).nil? && message_queue.closed?
-            # skip if message is nil, e.g. when message_queue
-            # is empty and closed
-            next unless message
+      STATSD_SLEEP_INTERVAL = ENV.fetch("DATADOG_STATSD_SLEEP", 0.25).to_f
+      STATSD_SENDER_MUTEX = Mutex.new
 
-            case message
-            when :flush
-              message_buffer.flush
-            when @queue_class
-              message.push(:go_on)
-            else
+      def send_loop
+        closed = false
+        while !closed
+          sleep STATSD_SLEEP_INTERVAL
+
+          # Because we rely on testing emptiness, we need to synchronize against other
+          # sender threads. Also, we don't want to be competing for the GIL with other
+          # sender threads anyway, and this will prevent that.
+          STATSD_SENDER_MUTEX.synchronize do
+            do_flush = false
+            do_close = false
+            queue_list = []
+            batch = []
+
+            while !message_queue.empty?
+              message = message_queue.pop
+              case message
+              when :close
+                do_close = true
+                break
+              when :flush
+                do_flush = true
+              when @queue_class
+                queue_list << message
+              else
+                batch << message if message
+               end
+            end
+
+            if CLOSEABLE_QUEUES && message_queue.closed?
+   	       		do_close = true
+            end
+
+            batch.each do |message|
               message_buffer.add(message)
             end
-          end
 
-          @message_queue = nil
-          @sender_thread = nil
-        end
-      else
-        def send_loop
-          loop do
-            message = message_queue.pop
+            if do_flush
+              message_buffer.flush
+            end
 
-            next unless message
+            queue_list.each do |q|
+              q.push(:go_on)
+            end
 
-            case message
-            when :close
+            if do_close
+              closed = true
               break
-            when :flush
-              message_buffer.flush
-            when @queue_class
-              message.push(:go_on)
-            else
-              message_buffer.add(message)
             end
           end
-
-          @message_queue = nil
-          @sender_thread = nil
         end
+
+        @message_queue = nil
+        @sender_thread = nil
       end
     end
   end
