@@ -4,15 +4,8 @@ require_relative 'connection'
 
 module Datadog
   class Statsd
-    class UDSConnection < Connection
-      class BadSocketError < StandardError; end
-
-      # DogStatsd unix socket path
-      attr_reader :socket_path
-
-      def initialize(socket_path, **kwargs)
-        super(**kwargs)
-
+    class UDSSender 
+      def initialize(socket_path)
         @socket_path = socket_path
         @socket = nil
       end
@@ -22,7 +15,7 @@ module Datadog
         @socket = nil
       end
 
-      private
+      attr_reader :socket
 
       def connect
         close if @socket
@@ -43,6 +36,84 @@ module Datadog
         # Connection class. An even better solution would be to make BadSocketError inherit
         # from a specific retryable error class in the Connection class.
         raise BadSocketError, "#{e.class}: #{e}"
+      end
+    end
+
+    class UDSRactorProxy
+      def initialize(socket_path)
+        @socket_path = socket_path
+      end
+
+      def connect
+        close if @ractor_sender
+        @ractor_sender = Ractor.new(@socket_path) { |socket_path|
+          sender = UDSSender.new(socket_path)
+          loop do
+            message = Ractor.receive
+            unless message
+              sender.close
+              break
+            end
+
+            begin
+              sender.send_message(message)
+            rescue Exception => e
+              # The send is intentionally asynchronous so there is no way to deliver this
+              # reliably to the caller. Just log
+              STDERR.puts(e)
+            end
+          end
+        }
+      end
+
+      def send_message(message)
+        connect unless @ractor_sender
+        @ractor_sender.send(message)
+      end
+
+      def close
+        return unless @ractor_sender
+        @ractor_sender.send(nil)
+        @ractor_sender = nil
+      end
+    end
+
+    class UDSConnection < Connection
+      class BadSocketError < StandardError; end
+
+      # DogStatsd unix socket path
+      attr_reader :socket_path
+
+      def initialize(socket_path, **kwargs)
+        super(**kwargs)
+        @socket_path = socket_path
+
+        unless ENV["DOGSTATS_USE_RACTOR"]
+          @socket_sender = UDSSender.new(socket_path)
+        else
+          @socket_sender = UDSRactorProxy.new(socket_path)
+        end
+      end
+
+      def close
+        @socket_sender.close()
+      end
+
+      unless ENV["DOGSTATS_USE_RACTOR"]
+        # This is for the rspec tests only.
+        def socket
+          @socket_sender.socket
+        end
+      end
+
+      private
+
+      def send_message(message)
+        @socket_sender.send_message(message)
+      end
+
+      def connect
+        @socket_sender.connect()
       end
     end
   end
