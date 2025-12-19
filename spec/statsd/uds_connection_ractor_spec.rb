@@ -1,5 +1,50 @@
 require 'spec_helper'
 
+# UDS server that listens and collects messages
+class TestServer
+  def initialize(socket_file)
+    @messages_received = []
+    server_ready = false
+    server_error = nil
+
+    @server_thread = Thread.new do
+      begin
+        # Use Socket with SOCK_DGRAM for datagram communication (matching the client)
+        server_socket = Socket.new(Socket::AF_UNIX, Socket::SOCK_DGRAM)
+        server_socket.bind(Socket.pack_sockaddr_un(socket_file))
+        server_ready = true
+
+        loop do
+          data, _ = server_socket.recvfrom(1024)
+          break if data.empty?
+          @messages_received << data
+        end
+        server_socket.close
+      rescue => e
+        server_error = e
+      end
+    end
+
+    # Wait for server to be ready
+    timeout = 1.0
+    start_time = Time.now
+    sleep 0.05 until server_ready || (Time.now - start_time) > timeout
+    raise "Server failed to start: #{server_error}" if server_error
+  end
+
+  def stop(subject)
+    # Closing the connection blocks on ractor termination. We know send will complete before
+    # this returns.
+    subject.close
+
+    # Wait for server thread to finish. This should happen quickly since we closed the client.
+    @server_thread.join(2)
+    @server_thread.kill if @server_thread.alive?
+
+    @messages_received
+  end
+end
+
 describe 'UDSConnection with DOGSTATS_USE_RACTOR enabled' do
   before do
     skip "Ractors not supported" unless defined?(Ractor)
@@ -94,51 +139,6 @@ describe 'UDSConnection with DOGSTATS_USE_RACTOR enabled' do
         # Even though the write fails (socket doesn't exist), the connection should still work
         subject.write('test1')
         expect { subject.write('test2') }.not_to raise_error
-      end
-    end
-
-    # UDS server that listens and collects messages
-    class TestServer
-      def initialize(socket_file)
-        @messages_received = []
-        server_ready = false
-        server_error = nil
-
-        @server_thread = Thread.new do
-          begin
-            # Use Socket with SOCK_DGRAM for datagram communication (matching the client)
-            server_socket = Socket.new(Socket::AF_UNIX, Socket::SOCK_DGRAM)
-            server_socket.bind(Socket.pack_sockaddr_un(socket_file))
-            server_ready = true
-
-            loop do
-              data, _ = server_socket.recvfrom(1024)
-              break if data.empty?
-              @messages_received << data
-            end
-            server_socket.close
-          rescue => e
-            server_error = e
-          end
-        end
-
-        # Wait for server to be ready
-        timeout = 1.0
-        start_time = Time.now
-        sleep 0.05 until server_ready || (Time.now - start_time) > timeout
-        raise "Server failed to start: #{server_error}" if server_error
-      end
-
-      def stop(subject)
-        # Closing the connection blocks on ractor termination. We know send will complete before
-        # this returns.
-        subject.close
-
-        # Wait for server thread to finish. This should happen quickly since we closed the client.
-        @server_thread.join(2)
-        @server_thread.kill if @server_thread.alive?
-
-        @messages_received
       end
     end
 
