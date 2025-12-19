@@ -13,6 +13,10 @@ describe 'UDSConnection with DOGSTATS_USE_RACTOR enabled' do
       allow(ENV).to receive(:[]).and_call_original
       allow(ENV).to receive(:[]).with('DOGSTATS_USE_RACTOR').and_return(nil)
 
+      expect(Datadog::Statsd::UDSRactorProxy)
+        .to receive(:new)
+        .exactly(0).times
+
       connection = Datadog::Statsd::UDSConnection.new('/tmp/socket')
       # We can't directly check the sender type, but we can verify it responds to the expected methods
       expect(connection).to respond_to(:close)
@@ -22,6 +26,10 @@ describe 'UDSConnection with DOGSTATS_USE_RACTOR enabled' do
     it 'uses UDSRactorProxy when DOGSTATS_USE_RACTOR is set' do
       allow(ENV).to receive(:[]).and_call_original
       allow(ENV).to receive(:[]).with('DOGSTATS_USE_RACTOR').and_return('1')
+
+      expect(Datadog::Statsd::UDSRactorProxy)
+        .to receive(:new)
+        .exactly(1).times
 
       connection = Datadog::Statsd::UDSConnection.new('/tmp/socket')
       # We can't directly check the sender type, but we can verify it responds to the expected methods
