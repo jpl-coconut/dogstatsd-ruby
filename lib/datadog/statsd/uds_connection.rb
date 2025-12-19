@@ -59,8 +59,8 @@ module Datadog
               sender.send_message(message)
             rescue Exception => e
               # The send is intentionally asynchronous so there is no way to deliver this
-              # reliably to the caller. Just log
-              STDERR.puts(e)
+              # reliably to the caller. Silently drop the error since we can't log it
+              # from inside the ractor without violating isolation constraints.
             end
           end
         }
@@ -73,7 +73,11 @@ module Datadog
 
       def close
         return unless @ractor_sender
-        @ractor_sender.send(nil)
+        begin
+          @ractor_sender.send(nil)
+        rescue Ractor::ClosedError
+          # The ractor port may already be closed, which is fine
+        end
         @ractor_sender = nil
       end
     end
